@@ -1,0 +1,1056 @@
+#!/usr/bin/env python3
+"""
+FGM Nanostructure Builder - single-file edition (version 1.0)
+
+Copyright (C) 2026 Shabbir
+    Python port of the builder, the window program, the corrected "fixed" mode and the
+    comparison tools in this file.
+
+Based on the nanoHUB tool "LAMMPS Input Structure Generator for Functionally Graded
+Materials (FGM)", Copyright (C) 2020 MSH Thakur, M Islam, S. Mojumder, AA Amin, MI Islam,
+released under the GNU General Public License v3 (see LICENSE.txt - keep it next to this file).
+
+This program is free software: you can redistribute it and/or modify it under the terms of
+the GNU General Public License as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version. It is distributed in the hope that it
+will be useful, but WITHOUT ANY WARRANTY. If you share this program, share this readable file
+together with LICENSE.txt and keep these notices.
+
+HOW TO USE
+    Open the window ........ double-click this file, or run:   py FGM_NW_Builder.py
+    Build without a window . py FGM_NW_Builder.py build --direction axial --bins 10 --out wire.nw
+    Check against nanoHUB .. py FGM_NW_Builder.py validate --ref nanohub_file.txt --direction axial
+    More options ........... py FGM_NW_Builder.py build --help
+
+NEEDS: Python 3 with NumPy. If NumPy is missing the program offers to install it
+(internet needed once).
+"""
+import argparse
+import math
+import os
+import sys
+import tempfile
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+VERSION = "v1.0"
+ABOUT_TEXT = (
+    "FGM Nanostructure Builder, single-file edition 1.0\n\n"
+    "Copyright (C) 2026 Shabbir: Python port, window program, corrected 'fixed' mode and "
+    "comparison tools.\n\n"
+    "Based on the nanoHUB tool 'LAMMPS Input Structure Generator for Functionally Graded "
+    "Materials (FGM)', Copyright (C) 2020 MSH Thakur, M Islam, S. Mojumder, AA Amin, MI Islam.\n\n"
+    "This is free software under the GNU General Public License v3 or later, with NO WARRANTY. "
+    "This file is the full source code. The license text is in LICENSE.txt next to it.")
+
+try:
+    import numpy as np
+except ImportError:  # handled in ensure_numpy()
+    np = None
+
+
+def ensure_numpy(interactive):
+    """Make sure NumPy is available; in the window version offer to install it."""
+    global np
+    if np is not None:
+        return True
+    msg = "NumPy is not installed. It can be installed with:\n    %s -m pip install numpy" % (sys.executable,)
+    if not interactive:
+        print(msg)
+        return False
+    root = tk.Tk()
+    root.withdraw()
+    if messagebox.askyesno("NumPy is missing", "This program needs NumPy.\n\nInstall it now? (internet needed once)"):
+        import subprocess
+        subprocess.call([sys.executable, "-m", "pip", "install", "numpy"])
+        try:
+            import numpy as _np
+            np = _np
+        except ImportError:
+            messagebox.showerror("Install failed", "Could not install NumPy automatically.\n\n" + msg)
+    root.destroy()
+    return np is not None
+
+
+# =====================================================================================
+# PART 1 - the builder (copy of the nanoHUB logic + corrected "fixed" mode)
+# =====================================================================================
+SHAPES = {"cylindrical": 1, "cuboid": 2, "sphere": 3}
+
+
+# ----------------------------------------------------------------------------------
+# small helpers
+# ----------------------------------------------------------------------------------
+def round_half_up(v):
+    """MATLAB/Octave round(): 0.5 rounds up (Python's round() would round to even)."""
+    return int(math.floor(v + 0.5))
+
+
+def grading_fraction(b, kind, p, custom=""):
+    """Grading function: position b (0..1) -> mass fraction x (0..1) of material 2."""
+    if kind == "power":  # P-FGM
+        x = b ** p
+    elif kind == "exp":  # E-FGM
+        x = 1.0 - math.exp(-(b ** p))
+    elif kind == "sigmoid":  # S-FGM
+        if b <= 0.5:
+            x = 0.5 * (2 * b) ** p
+        else:
+            x = 1.0 - 0.5 * (2 * (1 - b)) ** p
+    elif kind == "custom":
+        # Octave-style text such as "x^2" is turned into Python before evaluating it
+        expr = custom.replace(".^", "**").replace("^", "**").replace(".*", "*").replace("./", "/")
+        env = {"x": b, "exp": math.exp, "log": math.log, "sqrt": math.sqrt,
+               "sin": math.sin, "cos": math.cos, "tan": math.tan, "pi": math.pi, "abs": abs}
+        x = eval(expr, {"__builtins__": {}}, env)  # your own formula, run on your own PC
+    else:
+        raise ValueError("unknown grading kind: %s" % kind)
+    if isinstance(x, complex):  # e.g. negative number to a fractional power
+        x = 1.0
+    return min(max(float(x), 0.0), 1.0)
+
+
+def count_type2(x, n_atoms, m1, m2, fraction="mass"):
+    """Fraction x of material 2 -> how many of n_atoms atoms must be type 2.
+    fraction="mass": x is a mass fraction (nanoHUB). fraction="atom": x is an atom fraction."""
+    if fraction == "atom":
+        ratio = x
+    else:
+        ratio = (x / m2) / (x / m2 + (1.0 - x) / m1)
+    k = round_half_up(ratio * n_atoms)
+    return min(max(k, 0), n_atoms)
+
+
+USE_PREFILTER = True  # only generate the part of the crystal block that is needed
+
+
+def make_lattice(kind, N, a, ranges=None):
+    """All lattice sites of an N x N x N block of cubic cells, in the same order as
+    the original MATLAB meshgrid code (so atom IDs line up with nanoHUB).
+    ranges = ((xlo,xhi),(ylo,yhi),(zlo,zhi)) skips sites far outside the wire; the sites
+    that are kept stay in exactly the same order, so the result is identical but the
+    computer needs far less memory for long wires."""
+    k = np.arange(N + 1)
+    corners = k * a
+    half = 0.5 * a + k * a  # face-centre / body-centre positions
+
+    def pick(arr, axis):
+        if ranges is None:
+            return arr
+        lo, hi = ranges[axis]
+        return arr[(arr >= lo) & (arr <= hi)]
+
+    def grid(xs, ys, zs):
+        X, Y, Z = np.meshgrid(xs, ys, zs, indexing="xy")  # same shape rule as MATLAB
+        return np.column_stack([X.ravel(order="F"), Y.ravel(order="F"), Z.ravel(order="F")])
+
+    Cx, Cy, Cz = (pick(corners, i) for i in range(3))
+    Hx, Hy, Hz = (pick(half, i) for i in range(3))
+    if kind == "fcc":
+        parts = [grid(Cx, Cy, Cz), grid(Hx, Hy, Cz), grid(Cx, Hy, Hz), grid(Hx, Cy, Hz)]
+    else:  # bcc
+        parts = [grid(Cx, Cy, Cz), grid(Hx, Hy, Hz)]
+    return np.vstack(parts)
+
+
+# ----------------------------------------------------------------------------------
+# the builder
+# ----------------------------------------------------------------------------------
+def build_structure(shape="cylindrical", radius_nm=2.0, length_nm=20.0, xdim_nm=2.0,
+                    ydim_nm=2.0, direction="radial", grading="power", p=1.0, custom="",
+                    mass1=63.55, mass2=58.69, lattice="fcc", a1_nm=0.36, a2_nm=0.36,
+                    bins=10, seed=None, mode="nanohub", sample="center", fraction="mass",
+                    vacuum_xy=0.0, vacuum_z=0.0):
+    """mode="nanohub": exact copy of main.m.   mode="fixed": corrected version.
+    sample (fixed only): "center" = grading evaluated at the middle of each bin,
+                         "edge"   = first bin gets b=0, last bin gets b=1.
+    fraction (fixed only): "mass" (as nanoHUB) or "atom" = what the grading value means."""
+    fixed = mode == "fixed"
+    rng = np.random.default_rng(seed)
+    dim = SHAPES[shape]
+    axial = direction == "axial"
+    messages = []
+    frac_kind = fraction if fixed else "mass"
+
+    # --- sizes (nm -> Angstrom) ---
+    leng = length_nm * 10 if dim != 3 else radius_nm * 20
+    if dim != 2:
+        r_base = radius_nm * 10
+        x_len = 2 * r_base
+        y_len = 2 * r_base
+        z_len = leng
+    else:
+        x_len = 10 * xdim_nm
+        y_len = 10 * ydim_nm
+        z_len = leng
+        r_base = math.sqrt(x_len ** 2 + y_len ** 2) / 2
+    lat_p = 10 * (a1_nm + a2_nm) / 2  # one averaged lattice constant, like nanoHUB
+
+    # --- nanoHUB only: bins cannot be thinner than half a lattice constant ---
+    if not fixed:
+        limit = (2 * leng if axial else 2 * r_base) / lat_p
+        if bins > limit:
+            bins = round_half_up(limit)
+            messages.append("Warning: number of bins too high, reset to %d." % bins)
+    if bins < 2:
+        raise ValueError("need at least 2 bins")
+
+    # --- step 1: the crystal block ---
+    N = math.ceil(max(x_len, y_len, z_len) / lat_p)
+    cmax = 0.5 * lat_p + N * lat_p  # largest coordinate of nanoHUB's cubic block
+
+    z_cut = z_len
+    n_cells_z = None
+    if fixed and dim != 3:
+        # keep a whole number of unit cells along z, so periodic z has no stacking seam
+        n_cells_z = max(1, round_half_up(z_len / lat_p))
+        z_cut = (2 * n_cells_z - 1) * lat_p / 2 + 1e-6
+        if abs(n_cells_z * lat_p - z_len) > 1e-6:
+            messages.append("Length set to %d whole unit cells = %.2f A (asked for %.2f A)."
+                            % (n_cells_z, n_cells_z * lat_p, z_len))
+
+    if USE_PREFILTER:
+        c = cmax / 2
+        if dim == 2:
+            ranges = ((-lat_p, x_len + lat_p), (-lat_p, y_len + lat_p), (-lat_p, z_cut + lat_p))
+        else:
+            rr = radius_nm * 10 + lat_p
+            ranges = ((c - rr, c + rr), (c - rr, c + rr),
+                      (c - rr, c + rr) if dim == 3 else (-lat_p, z_cut + lat_p))
+    else:
+        ranges = None
+    pos = make_lattice(lattice, N, lat_p, ranges)
+    X, Y, Z = pos[:, 0], pos[:, 1], pos[:, 2]
+
+    # --- step 2: carve the shape ---
+    axis = None  # true centre line / centre point of the carved shape
+    if dim == 1:
+        cx = cy = cmax / 2
+        outside = (X - cx) ** 2 + (Y - cy) ** 2 - (radius_nm * 10) ** 2 > 0
+        delete = outside | (Z > z_cut)
+        axis = np.array([cx, cy, 0.0])
+    elif dim == 3:
+        cx = cy = cz = cmax / 2
+        delete = (X - cx) ** 2 + (Y - cy) ** 2 + (Z - cz) ** 2 - (radius_nm * 10) ** 2 > 0
+        axis = np.array([cx, cy, cz])
+    else:
+        delete = (X > x_len) | (Y > y_len) | (Z > z_cut)
+    pos = pos[~delete]
+    shift = pos.min(axis=0)
+    pos = pos - shift  # move the corner of the wire to (0,0,0)
+    if dim == 2:
+        axis = pos.max(axis=0) / 2 + shift  # centre of the cross-section
+    axis = axis - shift
+    n_atom = len(pos)
+    types = np.ones(n_atom, dtype=int)
+
+    # --- step 3: decide which bin every atom belongs to ---
+    if not fixed:
+        # nanoHUB way: overlapping closed ranges (an atom on an edge can sit in two bins)
+        if axial:
+            v = pos[:, 2]
+            n_zbox = bins - 1
+            step = (v.max() - v.min()) / n_zbox
+            lo, hi, denom = v.min(), v.min() + step, n_zbox
+        else:
+            xc, yc, zc = x_len / 2, y_len / 2, z_len / 2
+            if dim == 3:
+                v = np.sqrt((pos[:, 0] - xc) ** 2 + (pos[:, 1] - yc) ** 2 + (pos[:, 2] - zc) ** 2)
+            else:
+                v = np.sqrt((pos[:, 0] - xc) ** 2 + (pos[:, 1] - yc) ** 2)
+            step = r_base / (bins - 1)
+            lo, hi, denom = 0.0, step, bins
+        members = []
+        for i in range(1, bins + 1):
+            members.append(np.nonzero((v >= lo) & (v <= hi))[0])
+            lo = hi
+            hi = hi + step
+        edges = [(j * step, (j + 1) * step) for j in range(bins)]
+        b_list = [i / denom for i in range(1, bins + 1)]
+    else:
+        # fixed way: each atom in exactly one bin
+        if axial:
+            half = lat_p / 2
+            layer = np.rint(pos[:, 2] / half).astype(int)  # atomic layer number 0..K-1
+            K = int(layer.max()) + 1
+            bin_id = (layer * bins) // K
+            v = pos[:, 2]
+            edges = [(j * K / bins * half, (j + 1) * K / bins * half) for j in range(bins)]
+            if K < bins:
+                messages.append("Warning: only %d atomic layers for %d bins; some bins are empty." % (K, bins))
+        else:
+            d = pos - axis
+            v = np.sqrt((d ** 2).sum(axis=1)) if dim == 3 else np.sqrt(d[:, 0] ** 2 + d[:, 1] ** 2)
+            r_max = float(v.max())
+            width = r_max / bins
+            bin_id = np.minimum(np.floor(v / width).astype(int), bins - 1)
+            edges = [(j * width, (j + 1) * width) for j in range(bins)]
+        members = [np.nonzero(bin_id == j)[0] for j in range(bins)]
+        if sample == "edge":
+            b_list = [j / (bins - 1) for j in range(bins)]
+        else:
+            b_list = [(j + 0.5) / bins for j in range(bins)]
+
+    # --- step 4: repaint atoms of each bin ---
+    bin_info = []
+    yy = [0.0]  # "modelled" mass-fraction curve (first entry is 0, as in nanoHUB)
+    for j in range(bins):
+        idx = members[j]
+        n_in = len(idx)
+        b = b_list[j]
+        x = grading_fraction(b, grading, p, custom)
+        k = count_type2(x, n_in, mass1, mass2, frac_kind)
+        den = (n_in - k) * mass1 + k * mass2
+        yy.append(k * mass2 / den if den > 0 else float("nan"))
+        if k > 0:
+            types[idx[rng.choice(n_in, k, replace=False)]] = 2
+        bin_info.append({"bin": j + 1, "lo": edges[j][0], "hi": edges[j][1], "b": b, "x": x,
+                         "n_atoms": n_in, "n_type2_requested": k})
+    if fixed:
+        empty = [bi["bin"] for bi in bin_info if bi["n_atoms"] == 0]
+        if empty:
+            messages.append("Warning: empty bins %s (too many bins for this size)." % empty)
+
+    atoms = np.column_stack([np.arange(1, n_atom + 1), types, pos])
+
+    def span(c, pad):
+        lo_, hi_ = pos[:, c].min(), pos[:, c].max()
+        return (lo_ - pad, hi_ + pad) if pad > 0 else (lo_, hi_ + lat_p / 2)
+
+    box = {"x": span(0, vacuum_xy), "y": span(1, vacuum_xy), "z": span(2, vacuum_z)}
+    return {"atoms": atoms, "box": box, "lat_p": lat_p, "bins": bins, "bin_info": bin_info,
+            "yy": yy, "coord": v, "messages": messages, "mass1": mass1, "mass2": mass2,
+            "axial": axial, "mode": mode, "members": members, "axis": axis,
+            "n_cells_z": n_cells_z, "lattice": lattice}
+
+
+def verify(res):
+    """Self-checks for mode="fixed" (they cannot hold for the nanoHUB copy)."""
+    atoms, info = res["atoms"], res["bin_info"]
+    t2 = atoms[:, 1] == 2
+    out = []
+    out.append(("every atom is in exactly one bin",
+                sum(len(m) for m in res["members"]) == len(atoms)
+                and len(np.unique(np.concatenate(res["members"]))) == len(atoms)))
+    out.append(("type-2 count in every bin equals the requested count",
+                all(int(t2[m].sum()) == bi["n_type2_requested"] for m, bi in zip(res["members"], info))))
+    if res["n_cells_z"] is not None:
+        out.append(("wire is a whole number of unit cells along z (no periodic seam)", True))
+    return out
+
+
+def _write_data(f, result, max_atom_lines=None):
+    box, atoms = result["box"], result["atoms"]
+    f.write("LAMMPS readable file of FGM nanowire generated by FGM_Builder @nanohub\n\n")
+    f.write("\t\t%4i atoms\n" % len(atoms))
+    f.write("\t\t2 atom types\n")
+    for ax in "xyz":
+        f.write("\t%12.8f %12.8f \t%slo %shi\n" % (box[ax][0], box[ax][1], ax, ax))
+    f.write("\nMasses\n\n")
+    f.write("\t\t1 %12.8f\n" % result["mass1"])
+    f.write("\t\t2 %12.8f\n" % result["mass2"])
+    f.write("\nAtoms\n\n")
+    np.savetxt(f, atoms if max_atom_lines is None else atoms[:max_atom_lines], fmt="%d %d %f %f %f")
+
+
+def write_lammps_data(path, result):
+    """Write the LAMMPS data file in exactly the layout nanoHUB uses."""
+    with open(path, "w", newline="\n") as f:
+        _write_data(f, result)
+
+
+def lammps_data_text(result, max_atom_lines=None):
+    """The same file as text (the atom list can be cut short for an on-screen preview)."""
+    import io
+    buf = io.StringIO()
+    _write_data(buf, result, max_atom_lines)
+    return buf.getvalue()
+
+
+# ----------------------------------------------------------------------------------
+# command line
+# ----------------------------------------------------------------------------------
+def add_arguments(ap):
+    ap.add_argument("--shape", choices=list(SHAPES), default="cylindrical")
+    ap.add_argument("--radius", type=float, default=2.0, help="nm (cylinder, sphere)")
+    ap.add_argument("--length", type=float, default=20.0, help="nm (cylinder, cuboid)")
+    ap.add_argument("--xdim", type=float, default=2.0, help="nm (cuboid)")
+    ap.add_argument("--ydim", type=float, default=2.0, help="nm (cuboid)")
+    ap.add_argument("--direction", choices=["radial", "axial"], default="radial")
+    ap.add_argument("--grading", choices=["power", "exp", "sigmoid", "custom"], default="power")
+    ap.add_argument("--p", type=float, default=1.0, help="grading parameter")
+    ap.add_argument("--custom", default="", help='custom f(x), e.g. "x^2"')
+    ap.add_argument("--mass1", type=float, default=63.55)
+    ap.add_argument("--mass2", type=float, default=58.69)
+    ap.add_argument("--lattice", choices=["fcc", "bcc"], default="fcc")
+    ap.add_argument("--a1", type=float, default=0.36, help="lattice parameter 1, nm")
+    ap.add_argument("--a2", type=float, default=0.36, help="lattice parameter 2, nm")
+    ap.add_argument("--bins", type=int, default=10)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--mode", choices=["nanohub", "fixed"], default="nanohub",
+                    help="nanohub = exact copy (default); fixed = corrected version")
+    ap.add_argument("--sample", choices=["center", "edge"], default="center",
+                    help="fixed mode: grading evaluated at bin centre, or first bin b=0 / last bin b=1")
+    ap.add_argument("--fraction", choices=["mass", "atom"], default="mass",
+                    help="fixed mode: is the grading value a mass fraction or an atom fraction")
+    ap.add_argument("--vacuum-xy", type=float, default=0.0, help="empty space on each side in x and y, Angstrom")
+    ap.add_argument("--vacuum-z", type=float, default=0.0, help="empty space on each end in z, Angstrom")
+
+
+def params_from_args(a):
+    return dict(shape=a.shape, radius_nm=a.radius, length_nm=a.length, xdim_nm=a.xdim,
+                ydim_nm=a.ydim, direction=a.direction, grading=a.grading, p=a.p,
+                custom=a.custom, mass1=a.mass1, mass2=a.mass2, lattice=a.lattice,
+                a1_nm=a.a1, a2_nm=a.a2, bins=a.bins, seed=a.seed, mode=a.mode,
+                sample=a.sample, fraction=a.fraction, vacuum_xy=a.vacuum_xy,
+                vacuum_z=a.vacuum_z)
+
+
+def summary_lines(res):
+    """Text summary of a build: warnings, box, per-bin table and (fixed mode) self-checks."""
+    lines = list(res["messages"])
+    lines.append("mode: %s   atoms: %d   box: %s" % (res["mode"], len(res["atoms"]),
+                 {k: tuple(round(float(x), 4) for x in v) for k, v in res["box"].items()}))
+    lines.append("%4s %20s %8s %8s %10s" % ("bin", "range (A)", "atoms", "type2", "mass%2"))
+    for bi, y in zip(res["bin_info"], res["yy"][1:]):
+        lines.append("%4d %9.3f..%9.3f %8d %8d %10.2f" % (bi["bin"], bi["lo"], bi["hi"], bi["n_atoms"],
+                                                         bi["n_type2_requested"], 100 * y))
+    if res["mode"] == "fixed":
+        for name, ok in verify(res):
+            lines.append("[%s] %s" % ("PASS" if ok else "FAIL", name))
+    return lines
+
+
+def cli_build(argv=None):
+    ap = argparse.ArgumentParser(prog="FGM_NW_Builder.py build", description="FGM nanowire builder (nanoHUB copy + fixed mode)")
+    add_arguments(ap)
+    ap.add_argument("--out", default="fgm_nw.data")
+    a = ap.parse_args(argv)
+    res = build_structure(**params_from_args(a))
+    write_lammps_data(a.out, res)
+    print("\n".join(summary_lines(res)))
+    print("written:", a.out)
+
+
+# =====================================================================================
+# PART 2 - comparison with a data file made by nanoHUB
+# =====================================================================================
+def read_data(path):
+    with open(path) as f:
+        lines = f.read().split("\n")
+    k = next(i for i, l in enumerate(lines) if l.strip() == "Atoms")
+    header = [l.rstrip() for l in lines[:k]]
+    n = int(next(l for l in header if l.strip().endswith("atoms")).split()[0])
+    atoms = np.loadtxt(lines[k + 2:k + 2 + n])
+    return header, atoms
+
+
+def neighbour_pairs(pos, lat_p, lattice):
+    """All nearest-neighbour atom pairs (each pair once), found on the lattice grid."""
+    half = lat_p / 2.0
+    ijk = np.rint(pos / half).astype(np.int64)
+    ijk -= ijk.min(axis=0)
+    K = int(ijk.max()) + 4
+    key = (ijk[:, 0] + 1) * K * K + (ijk[:, 1] + 1) * K + (ijk[:, 2] + 1)
+    order = np.argsort(key)
+    skey = key[order]
+    if lattice == "fcc":  # 12 neighbours (a/2)(+-1,+-1,0) in all orders
+        offs = [(1, 1, 0), (1, -1, 0), (1, 0, 1), (1, 0, -1), (0, 1, 1), (0, 1, -1)]
+    else:  # bcc: 8 neighbours (a/2)(+-1,+-1,+-1)
+        offs = [(1, 1, 1), (1, 1, -1), (1, -1, 1), (1, -1, -1)]
+    I, J = [], []
+    for dx, dy, dz in offs:  # one direction of every pair is enough
+        nk = key + dx * K * K + dy * K + dz
+        at = np.searchsorted(skey, nk)
+        at[at >= len(skey)] = len(skey) - 1
+        hit = skey[at] == nk
+        I.append(np.nonzero(hit)[0])
+        J.append(order[at[hit]])
+    return np.concatenate(I), np.concatenate(J)
+
+
+def mixing_zscore(types, groups, pairs, n_perm=300, seed=0):
+    """Are the two kinds of atoms mixed randomly inside every bin?
+    Count unlike nearest-neighbour pairs, then shuffle the atoms inside each bin many times
+    and see where the real count falls (z-score; near 0 = random, large = clumped/ordered)."""
+    I, J = pairs
+    obs = int((types[I] != types[J]).sum())
+    rng = np.random.default_rng(seed)
+    idx = [np.nonzero(groups == g)[0] for g in np.unique(groups)]
+    null = np.empty(n_perm)
+    for r in range(n_perm):
+        t = types.copy()
+        for ix in idx:
+            t[ix] = types[rng.permutation(ix)]
+        null[r] = (t[I] != t[J]).sum()
+    sd = null.std()
+    return (obs - null.mean()) / sd if sd > 0 else 0.0
+
+
+def run_checks(res, ref_path):
+    """Compare a build result (nanoHUB-copy mode) with a nanoHUB data file.
+    Returns (lines, ok). Each line is (text, tag) with tag 'pass', 'fail' or None."""
+    out = []
+    state = {"ok": True}
+
+    def add(text, tag=None):
+        out.append((text, tag))
+
+    def report(name, ok, detail=""):
+        state["ok"] &= bool(ok)
+        add("[%s] %s %s" % ("PASS" if ok else "FAIL", name, detail), "pass" if ok else "fail")
+
+    mine = res["atoms"]
+    fd, tmp = tempfile.mkstemp(suffix=".nw")
+    os.close(fd)
+    try:
+        write_lammps_data(tmp, res)
+        h_mine, _ = read_data(tmp)
+    finally:
+        os.remove(tmp)
+    h_ref, ref = read_data(ref_path)
+
+    # 1. header
+    report("header identical (count, box, masses)", h_ref == h_mine)
+    if h_ref != h_mine:
+        for r, m in zip(h_ref, h_mine):
+            if r != m:
+                add("      nanoHUB: %r" % r)
+                add("      ours   : %r" % m)
+
+    # 2. positions (same order and same ids)
+    same_len = len(ref) == len(mine)
+    report("same number of atoms", same_len, "(%d vs %d)" % (len(ref), len(mine)))
+    if not same_len:
+        add("")
+        add("Check that every value in the form is exactly what you typed in nanoHUB.")
+        return out, False
+    diff = np.abs(ref[:, 2:5] - mine[:, 2:5]).max()
+    report("atom positions identical, same order",
+           diff < 1e-5 and (ref[:, 0] == mine[:, 0]).all(), "(max difference %.2e A)" % diff)
+
+    # 3. per-bin type-2 counts, measured on the nanoHUB file
+    t2_ref = ref[:, 1] == 2
+    t2_me = mine[:, 1] == 2
+    add("")
+    z_worst = 0.0
+    exact_ok = True
+    if not res["axial"]:
+        # Use the atoms each ring really contains (not a re-measured distance range): atoms that
+        # sit EXACTLY on a ring edge (for example the corner edges of a cuboid) would otherwise
+        # be counted in two neighbouring rings.
+        members = res["members"]
+        times = np.zeros(len(mine), dtype=int)
+        for m in members:
+            times[m] += 1
+        on_edge = times > 1
+        add("%4s %20s %8s %10s %10s %10s" % ("bin", "range (A)", "atoms", "requested", "nanoHUB", "ours"))
+        for bi, m in zip(res["bin_info"], members):
+            c_ref, c_me = int(t2_ref[m].sum()), int(t2_me[m].sum())
+            slack = int(on_edge[m].sum())  # atoms shared with a neighbour ring may add to the count
+            req = bi["n_type2_requested"]
+            exact_ok &= (req <= c_ref <= req + slack) and (req <= c_me <= req + slack)
+            add("%4d %9.3f..%9.3f %8d %10d %10d %10d" % (bi["bin"], bi["lo"], bi["hi"], bi["n_atoms"],
+                                                         req, c_ref, c_me))
+        if on_edge.any():
+            add("(%d atoms sit exactly on a ring edge and belong to two rings.)" % int(on_edge.sum()))
+    else:
+        for bi in res["bin_info"]:
+            v = res["coord"]
+            strict = (v > bi["lo"]) & (v < bi["hi"])
+            n_s = int(strict.sum())
+            p_exp = bi["n_type2_requested"] / bi["n_atoms"] if bi["n_atoms"] else 0.0
+            f_ref = t2_ref[strict].mean() if n_s else float("nan")
+            f_me = t2_me[strict].mean() if n_s else float("nan")
+            sd = math.sqrt(max(p_exp * (1 - p_exp), 1e-12) / max(n_s, 1))
+            z = (f_ref - p_exp) / sd if n_s else 0.0
+            z_worst = max(z_worst, abs(z))
+            add("%4d %9.3f..%9.3f %8d   expected %.3f   nanoHUB %.3f   ours %.3f   z=%+.1f"
+                % (bi["bin"], bi["lo"], bi["hi"], bi["n_atoms"], p_exp, f_ref, f_me, z))
+    if not res["axial"]:
+        report("radial: type-2 count per ring identical", exact_ok)
+    else:
+        report("axial: nanoHUB fractions agree with the rule (|z| < 4)", z_worst < 4,
+               "(worst |z| = %.1f)" % z_worst)
+    # 4. are the type-2 atoms mixed randomly inside each bin? (data-only stand-in for a simulation)
+    groups = np.full(len(mine), -1, dtype=int)
+    for j in reversed(range(len(res["members"]))):
+        groups[res["members"][j]] = j
+    groups[groups < 0] = len(res["members"])
+    if t2_ref.any() and t2_me.any() and not t2_ref.all():
+        pr = neighbour_pairs(mine[:, 2:5], res["lat_p"], res["lattice"])
+        z_ref = mixing_zscore(ref[:, 1].astype(int), groups, pr)
+        z_me = mixing_zscore(mine[:, 1].astype(int), groups, pr)
+        add("")
+        report("type-2 atoms are mixed randomly inside each bin (neighbour test)",
+               abs(z_ref) < 4 and abs(z_me) < 4, "(z: nanoHUB %+.1f, ours %+.1f; |z| < 4 is fine)" % (z_ref, z_me))
+    add("")
+    if state["ok"]:
+        add("OVERALL: ALL CHECKS PASSED", "pass")
+    else:
+        add("OVERALL: SOMETHING DIFFERS - see FAIL lines above", "fail")
+        add("Check that every value in the form is exactly what you typed in nanoHUB.")
+    return out, state["ok"]
+
+
+def cli_validate(argv=None):
+    ap = argparse.ArgumentParser(prog="FGM_NW_Builder.py validate")
+    add_arguments(ap)
+    ap.add_argument("--ref", required=True, help="data file generated by nanoHUB")
+    a = ap.parse_args(argv)
+    params = params_from_args(a)
+    params.update(mode="nanohub", vacuum_xy=0.0, vacuum_z=0.0)  # nanoHUB has neither
+    res = build_structure(**params)
+    lines, _ = run_checks(res, a.ref)
+    for text, _tag in lines:
+        print(text)
+
+
+# =====================================================================================
+# PART 3 - the window
+# =====================================================================================
+UI_SHAPES = {"Cylindrical": "cylindrical", "Cuboid": "cuboid", "Sphere": "sphere"}
+UI_DIRS = {"Radial": "radial", "Axial": "axial"}
+UI_GRADS = {"P-FGM": "power", "E-FGM": "exp", "S-FGM": "sigmoid", "Custom": "custom"}
+UI_LATTS = {"FCC": "fcc", "BCC": "bcc"}
+UI_MODES = {"nanoHUB copy (validated)": "nanohub", "Fixed (corrected)": "fixed"}
+UI_SAMPLES = {"Bin centre": "center", "First bin 0 / last bin 1": "edge"}
+UI_FRACTIONS = {"Mass fraction": "mass", "Atom fraction": "atom"}
+VIEWS = ["LAMMPS DATA FILE", "Bin table", "Grading curves", "Comparison with nanoHUB file"]
+PREVIEW_ATOMS = 5000
+
+
+class FormError(Exception):
+    pass
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("FGM Nanostructure Builder %s" % VERSION)
+        self.geometry("1180x740")
+        self.minsize(980, 640)
+        self.res = None
+        self.params = None
+        self.curves = None
+        self.compare_lines = None
+        self.v = {}  # form variables
+        self.w = {}  # form widgets
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+        menubar = tk.Menu(self)
+        helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(label="About / License", command=self.on_about)
+        menubar.add_cascade(label="Help", menu=helpmenu)
+        self.config(menu=menubar)
+        self._build_left()
+        self._build_right()
+        self.status = tk.StringVar(value="Fill in the form and press Build.")
+        ttk.Label(self, textvariable=self.status, relief="sunken", anchor="w", padding=(8, 3)).grid(
+            row=1, column=0, columnspan=2, sticky="ew")
+        self._update_state()
+        self.show_view("LAMMPS DATA FILE")
+
+    # ------------------------------------------------------------------ form
+    def _build_left(self):
+        left = ttk.Frame(self, padding=(14, 10))
+        left.grid(row=0, column=0, sticky="ns")
+        ttk.Label(left, text="FGM Nanostructure Builder", font=("Segoe UI", 17, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self._row = 1
+        self._left = left
+
+        def combo(key, label, options, default, parent=left):
+            ttk.Label(parent, text=label).grid(row=self._row, column=0, sticky="e", padx=(0, 8), pady=2)
+            var = tk.StringVar(value=default)
+            cb = ttk.Combobox(parent, textvariable=var, values=list(options), state="readonly", width=24)
+            cb.grid(row=self._row, column=1, sticky="w", pady=2)
+            cb.bind("<<ComboboxSelected>>", lambda e: self._update_state())
+            self.v[key], self.w[key] = var, cb
+            self._row += 1
+
+        def entry(key, label, default, parent=left):
+            ttk.Label(parent, text=label).grid(row=self._row, column=0, sticky="e", padx=(0, 8), pady=2)
+            var = tk.StringVar(value=default)
+            en = ttk.Entry(parent, textvariable=var, width=26)
+            en.grid(row=self._row, column=1, sticky="w", pady=2)
+            self.v[key], self.w[key] = var, en
+            self._row += 1
+
+        combo("shape", "Shape", UI_SHAPES, "Cylindrical")
+        entry("xdim", "X-dimension (nm)", "2")
+        entry("ydim", "Y-dimension (nm)", "2")
+        entry("radius", "Radius, R (nm)", "2")
+        entry("length", "Length, L (z) (nm)", "20")
+        combo("direction", "Grading Direction", UI_DIRS, "Radial")
+        combo("grading", "Grading Function", UI_GRADS, "P-FGM")
+        entry("custom", "Custom function, f(x) =", "")
+        entry("p", "p", "1")
+        entry("mass1", "Atomic Mass 1 (amu)", "63.55")
+        entry("mass2", "Atomic Mass 2 (amu)", "58.69")
+        combo("lattice", "Lattice Type", UI_LATTS, "FCC")
+        entry("a1", "Lattice Parameter 1 (nm)", "0.36")
+        entry("a2", "Lattice Parameter 2 (nm)", "0.36")
+        entry("bins", "Number of bins", "10")
+
+        adv = ttk.LabelFrame(left, text="Advanced (our own options)", padding=(8, 4))
+        adv.grid(row=self._row, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        self._row = 0
+        combo("mode", "Mode", UI_MODES, "nanoHUB copy (validated)", adv)
+        combo("sample", "Grading sampled at", UI_SAMPLES, "Bin centre", adv)
+        combo("fraction", "Grading value is a", UI_FRACTIONS, "Mass fraction", adv)
+        entry("vac_xy", "Vacuum x,y (A each side)", "0", adv)
+        entry("vac_z", "Vacuum z (A each end)", "0", adv)
+        entry("seed", "Random seed (blank = random)", "", adv)
+
+    def _set(self, key, on, readonly=False):
+        w = self.w[key]
+        if on:
+            w.state(["!disabled"])
+            if readonly:
+                w.state(["readonly"])
+        else:
+            w.state(["disabled"])
+
+    def _update_state(self):
+        shape = UI_SHAPES[self.v["shape"].get()]
+        self._set("xdim", shape == "cuboid")
+        self._set("ydim", shape == "cuboid")
+        self._set("radius", shape in ("cylindrical", "sphere"))
+        self._set("length", shape in ("cylindrical", "cuboid"))
+        custom = UI_GRADS[self.v["grading"].get()] == "custom"
+        self._set("custom", custom)
+        self._set("p", not custom)
+        fixed = UI_MODES[self.v["mode"].get()] == "fixed"
+        self._set("sample", fixed, readonly=True)
+        self._set("fraction", fixed, readonly=True)
+
+    def _num(self, key, label, positive=False, minimum=None, integer=False):
+        raw = self.v[key].get().strip()
+        try:
+            x = float(raw)
+        except ValueError:
+            raise FormError("%s must be a number (you typed %r)." % (label, raw))
+        if positive and x <= 0:
+            raise FormError("%s must be larger than 0." % label)
+        if minimum is not None and x < minimum:
+            raise FormError("%s must be at least %g." % (label, minimum))
+        if integer:
+            if x != int(x):
+                raise FormError("%s must be a whole number." % label)
+            return int(x)
+        return x
+
+    def _collect(self):
+        shape = UI_SHAPES[self.v["shape"].get()]
+        grading = UI_GRADS[self.v["grading"].get()]
+        mode = UI_MODES[self.v["mode"].get()]
+        p = dict(shape=shape, direction=UI_DIRS[self.v["direction"].get()], grading=grading,
+                 lattice=UI_LATTS[self.v["lattice"].get()], mode=mode,
+                 sample=UI_SAMPLES[self.v["sample"].get()], fraction=UI_FRACTIONS[self.v["fraction"].get()])
+        p["radius_nm"] = self._num("radius", "Radius", positive=True) if shape != "cuboid" else 2.0
+        p["length_nm"] = self._num("length", "Length", positive=True) if shape != "sphere" else 20.0
+        p["xdim_nm"] = self._num("xdim", "X-dimension", positive=True) if shape == "cuboid" else 2.0
+        p["ydim_nm"] = self._num("ydim", "Y-dimension", positive=True) if shape == "cuboid" else 2.0
+        p["p"] = self._num("p", "p", minimum=0) if grading != "custom" else 1.0
+        p["custom"] = self.v["custom"].get().strip() if grading == "custom" else ""
+        if grading == "custom":
+            if not p["custom"]:
+                raise FormError("Type a custom function, for example x^2.")
+            try:
+                grading_fraction(0.5, "custom", 1.0, p["custom"])
+            except Exception as e:
+                raise FormError("The custom function could not be evaluated: %s" % e)
+        p["mass1"] = self._num("mass1", "Atomic Mass 1", positive=True)
+        p["mass2"] = self._num("mass2", "Atomic Mass 2", positive=True)
+        p["a1_nm"] = self._num("a1", "Lattice Parameter 1", positive=True)
+        p["a2_nm"] = self._num("a2", "Lattice Parameter 2", positive=True)
+        p["bins"] = self._num("bins", "Number of bins", minimum=2, integer=True)
+        p["vacuum_xy"] = self._num("vac_xy", "Vacuum x,y", minimum=0)
+        p["vacuum_z"] = self._num("vac_z", "Vacuum z", minimum=0)
+        seed = self.v["seed"].get().strip()
+        if seed:
+            p["seed"] = self._num("seed", "Random seed", integer=True)
+        else:
+            p["seed"] = None
+        return p
+
+    # ---------------------------------------------------------------- result
+    def _build_right(self):
+        right = ttk.Frame(self, padding=(0, 10, 14, 0))
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)
+        bar = ttk.Frame(right)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(bar, text="Build", command=self.on_build).pack(side="left", padx=(0, 8))
+        self.btn_save = ttk.Button(bar, text="Save data file...", command=self.on_save)
+        self.btn_save.pack(side="left", padx=(0, 8))
+        self.btn_save.state(["disabled"])
+        ttk.Button(bar, text="Compare with nanoHUB file...", command=self.on_compare).pack(side="left")
+
+        pick = ttk.Frame(right)
+        pick.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(pick, text="Result:").pack(side="left", padx=(0, 6))
+        self.view = tk.StringVar(value=VIEWS[0])
+        cb = ttk.Combobox(pick, textvariable=self.view, values=VIEWS, state="readonly", width=36)
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.show_view(self.view.get()))
+
+        holder = ttk.Frame(right)
+        holder.grid(row=2, column=0, sticky="nsew")
+        holder.columnconfigure(0, weight=1)
+        holder.rowconfigure(0, weight=1)
+        self.text_frame = ttk.Frame(holder)
+        self.text_frame.grid(row=0, column=0, sticky="nsew")
+        self.text_frame.columnconfigure(0, weight=1)
+        self.text_frame.rowconfigure(0, weight=1)
+        mono = ("Consolas", 10) if sys.platform.startswith("win") else ("Courier", 10)
+        self.text = tk.Text(self.text_frame, wrap="none", font=mono, state="disabled", undo=False)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        sy = ttk.Scrollbar(self.text_frame, orient="vertical", command=self.text.yview)
+        sx = ttk.Scrollbar(self.text_frame, orient="horizontal", command=self.text.xview)
+        self.text.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        sy.grid(row=0, column=1, sticky="ns")
+        sx.grid(row=1, column=0, sticky="ew")
+        self.text.tag_configure("pass", foreground="#117a1f")
+        self.text.tag_configure("fail", foreground="#b3261e", font=mono + ("bold",))
+
+        self.canvas = tk.Canvas(holder, bg="white", highlightthickness=1, highlightbackground="#999")
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.canvas.bind("<Configure>", lambda e: self._draw_curves() if self.view.get() == VIEWS[2] else None)
+
+    def set_text(self, lines, empty_msg=""):
+        """lines: list of text or (text, tag)."""
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        if not lines:
+            self.text.insert("end", empty_msg)
+        for item in lines:
+            txt, tag = item if isinstance(item, tuple) else (item, None)
+            self.text.insert("end", txt + "\n", tag)
+        self.text.configure(state="disabled")
+
+    def show_view(self, name):
+        self.view.set(name)
+        if name == VIEWS[2]:
+            tk.Misc.tkraise(self.canvas)  # (Canvas has its own tkraise for drawn items)
+            self.update_idletasks()
+            self._draw_curves()
+            return
+        self.text_frame.tkraise()
+        if name == VIEWS[0]:
+            if self.res is None:
+                self.set_text([], "Nothing built yet. Fill in the form and press Build.")
+            else:
+                n = len(self.res["atoms"])
+                txt = lammps_data_text(self.res, PREVIEW_ATOMS)
+                if n > PREVIEW_ATOMS:
+                    txt += "\n... preview shows the first %d of %d atoms. The saved file contains all atoms." % (
+                        PREVIEW_ATOMS, n)
+                self.set_text(txt.split("\n"))
+        elif name == VIEWS[1]:
+            if self.res is None:
+                self.set_text([], "Nothing built yet. Fill in the form and press Build.")
+            else:
+                self.set_text([(l, "pass" if l.startswith("[PASS]") else "fail" if l.startswith("[FAIL]") else None)
+                               for l in summary_lines(self.res)])
+        else:
+            if self.compare_lines is None:
+                self.set_text([], "Press \"Compare with nanoHUB file...\" and pick a data file from nanoHUB.")
+            else:
+                self.set_text(self.compare_lines)
+
+    # ------------------------------------------------------------ plotting
+    def _make_curves(self):
+        p, res = self.params, self.res
+        xs = [i / 1000 for i in range(1001)]
+        ys = [100 * grading_fraction(x, p["grading"], p["p"], p["custom"]) for x in xs]
+        yy = res["yy"]
+        if res["mode"] == "nanohub":  # drawn the way nanoHUB draws its second curve
+            xm = [i / (len(yy) - 1) for i in range(len(yy))]
+            ym = [100 * y for y in yy]
+        else:
+            xm = [bi["b"] for bi in res["bin_info"]]
+            ym = [100 * y for y in yy[1:]]
+        pts = [(x, y) for x, y in zip(xm, ym) if y == y]
+        return [("Desired grading function", xs, ys, "#1f5fbf", "line"),
+                ("Built structure (per bin)", [a for a, _ in pts], [b for _, b in pts], "#d62728", "dots")]
+
+    def _draw_curves(self):
+        c = self.canvas
+        c.delete("all")
+        W, H = c.winfo_width(), c.winfo_height()
+        if W < 80 or H < 80:
+            return
+        if self.curves is None:
+            c.create_text(W / 2, H / 2, text="Nothing built yet. Fill in the form and press Build.", fill="#555")
+            return
+        L, R, T, B = 70, 25, 50, 60
+        pw, ph = W - L - R, H - T - B
+        px = lambda x: L + x * pw
+        py = lambda y: T + ph - y / 100 * ph
+        c.create_rectangle(L, T, L + pw, T + ph, outline="#444")
+        for i in range(6):
+            x, y = i / 5, i * 20
+            c.create_line(px(x), T + ph, px(x), T + ph + 5, fill="#444")
+            c.create_text(px(x), T + ph + 16, text="%.1f" % x)
+            c.create_line(L - 5, py(y), L, py(y), fill="#444")
+            c.create_text(L - 28, py(y), text="%d" % y)
+            if 0 < i < 5:
+                c.create_line(px(x), T, px(x), T + ph, fill="#e4e4e4")
+                c.create_line(L, py(y), L + pw, py(y), fill="#e4e4e4")
+        c.create_text(L + pw / 2, H - 14, text="Normalised position (0 = start, 1 = end)")
+        c.create_text(18, T + ph / 2, text="Material 2 (wt %)", angle=90)
+        x0 = L
+        for name, xs, ys, color, style in self.curves:
+            if style == "line":
+                c.create_line([v for x, y in zip(xs, ys) for v in (px(x), py(y))], fill=color, width=2)
+            else:
+                pts = [(px(x), py(y)) for x, y in zip(xs, ys)]
+                if len(pts) > 1:
+                    c.create_line([v for pt in pts for v in pt], fill=color, width=1, dash=(3, 3))
+                for X, Y in pts:
+                    c.create_oval(X - 4, Y - 4, X + 4, Y + 4, fill=color, outline=color)
+            c.create_line(x0, 22, x0 + 24, 22, fill=color, width=2)
+            c.create_text(x0 + 30, 22, text=name, anchor="w")
+            x0 += 230
+
+    # -------------------------------------------------------------- actions
+    def _busy(self, on):
+        self.config(cursor="watch" if on else "")
+        self.update_idletasks()
+
+    def on_build(self):
+        try:
+            params = self._collect()
+        except FormError as e:
+            messagebox.showerror("Please check the form", str(e))
+            return
+        self._busy(True)
+        try:
+            t0 = time.time()
+            res = build_structure(**params)
+            self.res, self.params = res, params
+            self.curves = self._make_curves()
+            dt = time.time() - t0
+        except Exception as e:
+            self._busy(False)
+            messagebox.showerror("Build failed", "%s: %s" % (type(e).__name__, e))
+            return
+        self._busy(False)
+        self.btn_save.state(["!disabled"])
+        extra = ("  " + res["messages"][0]) if res["messages"] else ""
+        self.status.set("Built %d atoms in %.1f s (mode: %s).%s" % (len(res["atoms"]), dt, res["mode"], extra))
+        self.show_view(VIEWS[0])
+
+    def on_about(self):
+        messagebox.showinfo("About FGM Nanostructure Builder", ABOUT_TEXT)
+
+    def on_save(self):
+        if self.res is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save LAMMPS data file", defaultextension=".nw", initialfile="fgm_nw.nw",
+            filetypes=[("LAMMPS data file", "*.nw *.data *.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            write_lammps_data(path, self.res)
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+            return
+        self.status.set("Saved %d atoms to %s" % (len(self.res["atoms"]), path))
+
+    def on_compare(self):
+        try:
+            params = self._collect()
+        except FormError as e:
+            messagebox.showerror("Please check the form", str(e))
+            return
+        path = filedialog.askopenfilename(
+            title="Pick the data file downloaded from nanoHUB",
+            filetypes=[("LAMMPS data file", "*.nw *.data *.txt *.dat"), ("All files", "*.*")])
+        if not path:
+            return
+        note = []
+        if params["mode"] != "nanohub":
+            note.append("Note: nanoHUB has no 'fixed' mode, so the comparison uses the nanoHUB-copy mode.")
+        if params["vacuum_xy"] or params["vacuum_z"]:
+            note.append("Note: vacuum padding is ignored for the comparison (nanoHUB has none).")
+        params.update(mode="nanohub", vacuum_xy=0.0, vacuum_z=0.0)
+        self._busy(True)
+        try:
+            res = build_structure(**params)
+            lines, ok = run_checks(res, path)
+        except Exception as e:
+            self._busy(False)
+            messagebox.showerror("Comparison failed",
+                                 "%s: %s\n\nIs this a LAMMPS data file made by nanoHUB?" % (type(e).__name__, e))
+            return
+        self._busy(False)
+        head = ["Compared with: %s" % path, "Using the values currently in the form."] + note + [""]
+        self.compare_lines = head + lines
+        self.status.set("Comparison finished: %s" % ("ALL CHECKS PASSED" if ok else "something differs"))
+        self.show_view(VIEWS[3])
+
+
+def hide_own_console():
+    """Double-clicked on Windows: hide the black console window that opened only for us."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        procs = (ctypes.c_uint * 8)()
+        if k.GetConsoleProcessList(procs, 8) <= 2:  # only py.exe/python.exe are attached
+            hwnd = k.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+
+def main():
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # sharper text on high-DPI screens
+        except Exception:
+            pass
+    try:
+        os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    try:
+        if not ensure_numpy(True):
+            return
+        hide_own_console()
+        App().mainloop()
+    except Exception:
+        import traceback
+        text = traceback.format_exc()
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("FGM Nanostructure Builder - unexpected error", text)
+            root.destroy()
+        except Exception:
+            print(text)
+
+
+def entry():
+    args = sys.argv[1:]
+    if args and args[0] in ("build", "validate"):
+        if not ensure_numpy(False):
+            sys.exit(1)
+        (cli_build if args[0] == "build" else cli_validate)(args[1:])
+    elif args and args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+    else:
+        main()
+
+
+if __name__ == "__main__":
+    entry()

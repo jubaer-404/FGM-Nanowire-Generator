@@ -1,0 +1,6 @@
+{
+  "name": "Multi-Material FGM Nanostructure Generator",
+  "description": "Generate functionally graded nanowires and nanostructures with multi-material segmented base alloys (Cu, Ni, Fe, etc.) and graded elements for LAMMPS MD simulations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
