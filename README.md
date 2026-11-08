@@ -15,3 +15,5 @@
   - Box bounds `xlo`, `ylo`, `zlo` start strictly from `0.00000000`.
   - Generates `.data` files, `.xyz` coordinate files, `.csv` bin statistics, and simulation input scripts (`in.fgm`).
 - **Interactive 3D WebGL Viewer**: Orbit, pan, zoom, inspect atom types, slice cross-sections, and toggle wireframe box bounds.
+
+Please access through this link "https://ai.studio/apps/dfdc4d05-953f-4eb9-8642-0742045096eb"
