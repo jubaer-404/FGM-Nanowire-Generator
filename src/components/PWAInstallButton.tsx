@@ -67,10 +67,33 @@ export const PWAInstallButton: React.FC = () => {
             </div>
 
             <div className="space-y-3 text-xs text-slate-300">
-              {/* Method 1: Instant Browser Desktop App Install */}
-              <div className="p-3 rounded-xl bg-slate-950 border border-sky-500/30 space-y-1.5">
-                <span className="font-bold text-sky-300 flex items-center gap-1.5">
-                  <span className="px-1.5 py-0.5 rounded bg-sky-500/20 text-[10px]">Method 1</span>
+              {/* Method 1: GitHub Pages Direct Online Access */}
+              <div className="p-3.5 rounded-xl bg-gradient-to-r from-sky-950/60 to-slate-900 border border-sky-500/40 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-sky-300 flex items-center gap-1.5">
+                    <span className="px-1.5 py-0.5 rounded bg-sky-500/20 text-[10px] text-sky-300 font-bold">Recommended</span>
+                    Publish to GitHub Pages (Direct Online Link)
+                  </span>
+                  <span className="text-[10px] text-emerald-400 font-semibold">Zero Installation for Users</span>
+                </div>
+                <p className="text-[11px] text-slate-300">
+                  Anyone can use this software directly in their browser via your GitHub account by clicking your link:
+                </p>
+                <div className="p-2 rounded-lg bg-black/60 font-mono text-[11px] text-emerald-300 border border-slate-800">
+                  https://&lt;your-username&gt;.github.io/&lt;your-repo-name&gt;/
+                </div>
+                <div className="text-[10px] text-slate-400 space-y-1 pt-1">
+                  <div>1. Create a public repository on GitHub.</div>
+                  <div>2. Push this codebase: <code className="text-sky-300">git push -u origin main</code></div>
+                  <div>3. In repo <strong>Settings → Pages</strong>, set Source to <strong>GitHub Actions</strong>.</div>
+                  <div className="text-slate-400">The included workflow (<code className="text-slate-300">.github/workflows/deploy.yml</code>) builds and deploys it automatically!</div>
+                </div>
+              </div>
+
+              {/* Method 2: Instant Browser Desktop App Install */}
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                <span className="font-bold text-slate-200 flex items-center gap-1.5">
+                  <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px]">Method 2</span>
                   1-Click Desktop App (Chrome / Edge / Brave)
                 </span>
                 <p className="text-[11px] text-slate-400">
@@ -81,37 +104,18 @@ export const PWAInstallButton: React.FC = () => {
                 </p>
               </div>
 
-              {/* Method 2: Local Node.js Standalone Package */}
-              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
-                <span className="font-bold text-slate-200 flex items-center gap-1.5">
-                  <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px]">Method 2</span>
-                  Local Software Package (Node.js & npm)
-                </span>
-                <p className="text-[11px] text-slate-400">
-                  Download or clone this project folder to your PC, then open your terminal in the folder:
-                </p>
-                <pre className="p-2.5 rounded-lg bg-black/60 font-mono text-[11px] text-sky-300 overflow-x-auto space-y-1">
-                  <div># 1. Install dependencies</div>
-                  <div>npm install</div>
-                  <div># 2. Launch software locally</div>
-                  <div>npm run dev</div>
-                </pre>
-                <p className="text-[10px] text-slate-400">
-                  The software will open at <code className="text-sky-300">http://localhost:3000</code>.
-                </p>
-              </div>
-
-              {/* Method 3: Desktop Executable Build */}
+              {/* Method 3: Local Node.js Standalone Package */}
               <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
                 <span className="font-bold text-slate-200 flex items-center gap-1.5">
                   <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px]">Method 3</span>
-                  Production Standalone Package
+                  Local PC Package (Node.js & npm)
                 </span>
                 <p className="text-[11px] text-slate-400">
-                  Compile into an ultra-fast optimized static release:
+                  On Windows: double-click <strong>start.bat</strong>. Or on macOS/Linux terminal:
                 </p>
-                <pre className="p-2 rounded-lg bg-black/60 font-mono text-[11px] text-sky-300">
-                  npm run build && npm run preview
+                <pre className="p-2.5 rounded-lg bg-black/60 font-mono text-[11px] text-sky-300 overflow-x-auto space-y-1">
+                  <div>npm install</div>
+                  <div>npm run dev</div>
                 </pre>
               </div>
             </div>

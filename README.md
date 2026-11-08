@@ -1,76 +1,67 @@
 # Multi-Material FGM Nanostructure Generator
 
-LAMMPS MD-Ready Generator for Multi-Material Segmented Base Alloys (Cu, Ni, Fe, Al, Ti, Pt, Au, etc.) with Functionally Graded Material (FGM) Distributions.
+> **LAMMPS MD-Ready Generator for Multi-Material Segmented Base Alloys (Cu, Ni, Fe, Al, Ti, Pt, Au, etc.) with Functionally Graded Material (FGM) Distributions.**
 
 ---
 
-## Option 1: Instant 1-Click Desktop App (Recommended)
-You don't even need to install Node.js to use it as a desktop application!
-1. Open the application URL in Google Chrome, Microsoft Edge, or Brave.
-2. In the top header of the app or in your browser's address bar, click **"Install Desktop App"** (or the computer icon with down arrow).
-3. The app is installed directly to your PC desktop and taskbar, and works **100% offline** with standalone window mode.
+## 🌐 Publish & Use Directly on GitHub (GitHub Pages)
 
----
+Anyone can access and use this full software directly in their web browser via your GitHub account with zero installation:
 
-## Option 2: Deploy & Run Locally on Your PC (Node.js)
+### Step 1: Create a Repository on GitHub
+1. Go to [github.com/new](https://github.com/new).
+2. Enter a repository name, for example: `fgm-nanowire-generator`.
+3. Choose **Public**, and click **Create repository**.
 
-### Prerequisites
-- Install **Node.js (version 18 or newer)** from [https://nodejs.org](https://nodejs.org).
-
-### On Windows
-Just double-click **`start.bat`**!
-- It automatically installs any missing dependencies on first run.
-- It automatically launches your browser to `http://localhost:3000`.
-
-### On macOS / Linux
-Open a terminal in the folder and run:
+### Step 2: Push this Project to GitHub
+In your project folder on your PC, open a terminal and run:
 ```bash
-chmod +x start.sh
-./start.sh
+git init
+git add .
+git commit -m "Initial release of Multi-Material FGM Generator"
+git branch -M main
+git remote add origin https://github.com/<YOUR-USERNAME>/<YOUR-REPO-NAME>.git
+git push -u origin main
 ```
+*(Replace `<YOUR-USERNAME>` and `<YOUR-REPO-NAME>` with your GitHub username and repo name).*
 
-### Manual Command Line Steps
-```bash
-# 1. Install dependencies
-npm install
+### Step 3: Enable GitHub Pages in 2 Clicks
+1. In your GitHub repository, click **Settings** (top tab) → **Pages** (left sidebar).
+2. Under **Build and deployment** → **Source**, select:
+   👉 **`GitHub Actions`** (instead of Deploy from a branch).
+3. That's it! The included `.github/workflows/deploy.yml` workflow will automatically build and publish your app.
 
-# 2. Run local development server
-npm run dev
-
-# 3. Open in browser:
-# http://localhost:3000
+### Step 4: Access Your Live App
+Your live application will be instantly available at:
 ```
+https://<YOUR-USERNAME>.github.io/<YOUR-REPO-NAME>/
+```
+Anyone visiting this link can design multi-material nanowires, preview 3D atoms, and export LAMMPS simulation files directly in their browser without downloading anything!
 
 ---
 
-## Option 3: Production Static Build
-To generate an optimized, fast offline web package:
-```bash
-npm run build
-npm run preview
-```
-The compiled standalone files will be in the `dist/` directory and can be hosted on any static web server, Apache, Nginx, or GitHub Pages.
+## 💻 Other Ways to Run
+
+### 1. Instant Desktop App Mode (PWA)
+When viewing the site in Chrome or Edge, click **"Install on PC"** in the top bar to install it as an offline native desktop window.
+
+### 2. Run Locally on your PC (Node.js)
+- **Windows**: Double-click `start.bat`.
+- **macOS / Linux**: Run `./start.sh`.
+- **Manual CLI**:
+  ```bash
+  npm install
+  npm run dev
+  ```
+  Open `http://localhost:3000`.
 
 ---
 
-## Option 4: Packaging as Native `.exe` / `.dmg` with Electron
-If you want to package the app into a standalone desktop `.exe` (Windows) or `.dmg` (Mac):
-```bash
-# 1. Build the production web bundle
-npm run build
-
-# 2. Use nativefier or electron-builder:
-npx nativefier --name "FGM Builder" "http://localhost:3000"
-```
-Or with Tauri / Electron to bundle into an installer.
-
----
-
-## Key Features
-- **Multi-Material Base Segments**: Build nanowires with arbitrary segmented alloy layers (e.g. Cu-Ni-Fe) with exact segment lengths (nm) or core-shell concentric shells.
+## 🔬 Core Features
+- **Multi-Material Base Segments**: Segmented alloy layers (e.g. Cu-Ni-Fe) with exact segment lengths (nm) or core-shell concentric shells.
 - **Graded Material Substitution**: Distribute additive elements (Au, Ni, Al, Pt, etc.) using Power-Law (P-FGM), Exponential (E-FGM), Sigmoidal (S-FGM), Linear, or Custom formulas.
 - **LAMMPS & OVITO 100% Compatible**:
-  - Atom types contiguous strictly from `1..N`.
+  - Atom types contiguous strictly from `1..N` (no gaps or phantom types).
   - Box bounds `xlo`, `ylo`, `zlo` start strictly from `0.00000000`.
   - Generates `.data` files, `.xyz` coordinate files, `.csv` bin statistics, and simulation input scripts (`in.fgm`).
 - **Interactive 3D WebGL Viewer**: Orbit, pan, zoom, inspect atom types, slice cross-sections, and toggle wireframe box bounds.
